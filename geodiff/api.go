@@ -821,7 +821,7 @@ func convertConflicts(src []ConflictFeature) []conflictFeature {
 		cf := conflictFeature{
 			Table: dcf.TableName,
 			Type:  "conflict",
-			FID:   fmt.Sprintf("%d", dcf.PK),
+			FID:   dcf.FID(),
 		}
 		for _, dci := range dcf.Items {
 			cf.Changes = append(cf.Changes, conflictItem{
