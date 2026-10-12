@@ -43,6 +43,8 @@ Binary changeset files produced by go-geodiff are **byte-identical** to those pr
 
 Applying a changeset to a GeoPackage with a spatial index runs its `rtree_*` triggers. Like upstream (through libgpkg), go-geodiff provides the functions they call: `ST_IsEmpty`, `ST_MinX`, `ST_MaxX`, `ST_MinY` and `ST_MaxY`. `modernc.org/sqlite` registers functions for the whole process, when the first driver opens; a function of the same name your program registered before that is kept.
 
+Rebase identifies rows by their whole primary key, whatever its type: text, blob and composite keys come through exactly as written. When both sides insert the same key, ours is renumbered only if the table has a single integer key; otherwise theirs' row stands and any value ours inserted differently is reported as a conflict. `ConflictFeature.PKValues` carries the key's values and `FID()` gives it as a string.
+
 ## What's included
 
 | Package | Purpose |

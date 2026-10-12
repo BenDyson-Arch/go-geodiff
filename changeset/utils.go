@@ -28,10 +28,45 @@ type ConflictItem struct {
 // ConflictFeature describes all conflicts for a single feature (row).
 // This is the typed value the product stores and the review UI paints.
 // It is not written into the changeset blob.
+//
+// PKValues holds the row's primary-key values in column order (one per PK
+// column), exactly as in the changeset: text, blob and composite keys are
+// kept as they are. PK is the key as a number, set only when the table has
+// a single integer primary key (0 otherwise). Use FID for a display/JSON key.
 type ConflictFeature struct {
 	PK        int            `json:"pk"`
+	PKValues  []Value        `json:"pk_values,omitempty"`
 	TableName string         `json:"table"`
 	Items     []ConflictItem `json:"items"`
+}
+
+// FID is the row's key as a string: the number for a single integer key
+// (as before), the text of a single text key, base64 of a single blob key,
+// and otherwise (composite or other types) a JSON array of the key values.
+func (cf ConflictFeature) FID() string {
+	switch len(cf.PKValues) {
+	case 0:
+		return fmt.Sprintf("%d", cf.PK)
+	case 1:
+		v := cf.PKValues[0]
+		switch v.Type() {
+		case TypeInt:
+			n, _ := v.AsInt()
+			return fmt.Sprintf("%d", n)
+		case TypeText:
+			s, _ := v.AsText()
+			return s
+		case TypeBlob:
+			b, _ := v.AsBlob()
+			return base64.StdEncoding.EncodeToString(b)
+		}
+	}
+	vals := make([]any, len(cf.PKValues))
+	for i, v := range cf.PKValues {
+		vals[i], _ = valueToJSON(v)
+	}
+	raw, _ := json.Marshal(vals)
+	return string(raw)
 }
 
 // IsValid reports whether this feature has at least one conflict item.
@@ -248,7 +283,7 @@ func conflictToJSON(cf *ConflictFeature) (map[string]any, error) {
 	return map[string]any{
 		"table":   cf.TableName,
 		"type":    "conflict",
-		"fid":     fmt.Sprintf("%d", cf.PK),
+		"fid":     cf.FID(),
 		"changes": changes,
 	}, nil
 }

@@ -9,6 +9,7 @@ package changeset
 
 import (
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 )
@@ -18,45 +19,58 @@ import (
 // pkKey returns a string key that uniquely identifies a row by its primary-key
 // column values.  For INSERT entries the PK is taken from NewValues; otherwise
 // from OldValues.
-func pkKey(entry *ChangesetEntry) string {
-	var sb strings.Builder
+func pkKey(entry *ChangesetEntry) string { return RowKey(entry) }
+
+// PrimaryKeyValues returns the entry's primary-key values in column order:
+// from NewValues for an INSERT, from OldValues otherwise.
+func PrimaryKeyValues(entry *ChangesetEntry) []Value {
 	values := entry.OldValues
 	if entry.Op == OpInsert {
 		values = entry.NewValues
 	}
+	var out []Value
 	for i, isPK := range entry.Table.PrimaryKeys {
-		if !isPK {
-			continue
+		if isPK && i < len(values) {
+			out = append(out, values[i])
 		}
-		// Use a compact type-tagged encoding so distinct types don't
-		// accidentally collide.
-		v := values[i]
-		sb.WriteByte('[')
+	}
+	return out
+}
+
+// RowKey returns a string that identifies the entry's row within its table:
+// a type-tagged encoding of every primary-key column (text and blob values
+// are length-prefixed, so no two distinct keys encode the same). Integer 1
+// and text '1' are different keys.
+func RowKey(entry *ChangesetEntry) string {
+	var sb strings.Builder
+	for _, v := range PrimaryKeyValues(entry) {
 		switch v.Type() {
 		case TypeInt:
-			sb.WriteString("I:")
 			n, _ := v.AsInt()
+			sb.WriteString("I")
 			sb.WriteString(strconv.FormatInt(n, 10))
 		case TypeDouble:
-			sb.WriteString("D:")
 			f, _ := v.AsDouble()
-			sb.WriteString(strconv.FormatFloat(f, 'g', -1, 64))
+			sb.WriteString("D")
+			sb.WriteString(strconv.FormatUint(math.Float64bits(f), 16))
 		case TypeText:
-			sb.WriteString("T:")
 			s, _ := v.AsText()
+			sb.WriteString("T")
+			sb.WriteString(strconv.Itoa(len(s)))
+			sb.WriteByte(':')
 			sb.WriteString(s)
 		case TypeBlob:
-			sb.WriteString("B:")
 			b, _ := v.AsBlob()
-			sb.WriteString(BinToHex(b))
+			sb.WriteString("B")
+			sb.WriteString(strconv.Itoa(len(b)))
+			sb.WriteByte(':')
+			sb.Write(b)
 		case TypeNull:
 			sb.WriteString("N")
-		case TypeUndefined:
-			sb.WriteString("U")
 		default:
-			sb.WriteString("?")
+			sb.WriteString("U")
 		}
-		sb.WriteByte(']')
+		sb.WriteByte(';')
 	}
 	return sb.String()
 }

@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"slices"
 
 	"github.com/BenDyson-Arch/go-geodiff/changeset"
 )
@@ -27,12 +28,20 @@ type ConflictFeature = changeset.ConflictFeature
 // Internal types for tracking rebase state
 // ---------------------------------------------------------------------------
 
+// Rows are identified by changeset.RowKey: every primary-key column, typed.
+// Text, blob and composite keys are compared and written back exactly as
+// they are. Only a table with a single integer primary key can have our
+// insert renumbered when theirs inserted the same key.
+
 // tableRebaseInfo tracks the state of a single table extracted from the
 // "theirs" changeset.
 type tableRebaseInfo struct {
-	inserted map[int]bool              // set of PKs that were inserted
-	deleted  map[int]bool              // set of PKs that were deleted
-	updated  map[int][]changeset.Value // PK → new column values
+	inserted map[string][]changeset.Value // row key → theirs' inserted values
+	deleted  map[string]bool              // row keys theirs deleted
+	updated  map[string][]changeset.Value // row key → theirs' new column values
+
+	hasIntInserted bool  // theirs inserted a single-integer key
+	maxIntInserted int64 // the largest such key
 }
 
 // databaseRebaseInfo tracks the state of all tables from the "theirs" changeset.
@@ -40,55 +49,49 @@ type databaseRebaseInfo struct {
 	tables map[string]*tableRebaseInfo
 }
 
+// pkeyMapping is what happens to one of our rows: renumbered to newPK, or
+// gone (theirs deleted it).
+type pkeyMapping struct {
+	newPK int64
+	gone  bool
+}
+
 // rebaseMapping tracks how primary keys need to be remapped in the rebased changeset.
 type rebaseMapping struct {
-	// table name → old PK → new PK
-	mapIds map[string]map[int]int
+	// table name → row key → mapping
+	mapIds map[string]map[string]pkeyMapping
 
-	// table name → set of insert PKs that haven't been remapped yet
+	// table name → integer insert PKs (→ row key) that haven't been remapped yet
 	// (important because our mapping could cause FID conflicts with PKs
 	// that weren't previously in conflict, e.g. if 4,5,6 get mapped
 	// 4→6, 5→7 then the original 6 will need to be remapped too: 6→8)
-	unmappedInsertIds map[string]map[int]bool
-}
+	unmappedInsertIds map[string]map[int64]string
 
-const invalidFID = -1 // special PK value for deleted rows
+	// table name → row keys both sides inserted that can't be renumbered
+	// (text, blob or composite keys): theirs' row stands.
+	collided map[string]map[string]bool
+}
 
 func newRebaseMapping() *rebaseMapping {
 	return &rebaseMapping{
-		mapIds:            make(map[string]map[int]int),
-		unmappedInsertIds: make(map[string]map[int]bool),
+		mapIds:            make(map[string]map[string]pkeyMapping),
+		unmappedInsertIds: make(map[string]map[int64]string),
+		collided:          make(map[string]map[string]bool),
 	}
 }
 
-func (m *rebaseMapping) addPkeyMapping(table string, oldPK, newPK int) {
+func (m *rebaseMapping) add(table, key string, pm pkeyMapping) {
 	ids, ok := m.mapIds[table]
 	if !ok {
-		ids = make(map[int]int)
+		ids = make(map[string]pkeyMapping)
 		m.mapIds[table] = ids
 	}
-	ids[oldPK] = newPK
+	ids[key] = pm
 }
 
-func (m *rebaseMapping) hasOldPkey(table string, pk int) bool {
-	ids, ok := m.mapIds[table]
-	if !ok {
-		return false
-	}
-	_, exists := ids[pk]
-	return exists
-}
-
-func (m *rebaseMapping) getNewPkey(table string, pk int) (int, error) {
-	ids, ok := m.mapIds[table]
-	if !ok {
-		return 0, fmt.Errorf("internal error: getNewPkey for unknown table %s", table)
-	}
-	newPK, ok := ids[pk]
-	if !ok {
-		return 0, fmt.Errorf("internal error: getNewPkey for pk %d in table %s", pk, table)
-	}
-	return newPK, nil
+func (m *rebaseMapping) lookup(table, key string) (pkeyMapping, bool) {
+	pm, ok := m.mapIds[table][key]
+	return pm, ok
 }
 
 // ---------------------------------------------------------------------------
@@ -98,30 +101,50 @@ func (m *rebaseMapping) getNewPkey(table string, pk int) (int, error) {
 // errNoPrimaryKey is returned when a changeset entry lacks a primary key column.
 var errNoPrimaryKey = fmt.Errorf("entry has no primary key column")
 
-// getPrimaryKey extracts the primary key value from a changeset entry.
-// For INSERT, it reads from newValues; for DELETE/UPDATE, from oldValues.
-func getPrimaryKey(entry *changeset.ChangesetEntry) (int, error) {
-	for i, isPK := range entry.Table.PrimaryKeys {
-		if isPK {
-			if entry.Op == changeset.OpInsert {
-				n, _ := entry.NewValues[i].AsInt()
-				return int(n), nil
-			}
-			n, _ := entry.OldValues[i].AsInt()
-			return int(n), nil
-		}
+// rowKey identifies the entry's row (see changeset.RowKey).
+func rowKey(entry *changeset.ChangesetEntry) (string, error) {
+	if !hasPrimaryKey(entry) {
+		return "", errNoPrimaryKey
 	}
-	return 0, errNoPrimaryKey
+	return changeset.RowKey(entry), nil
 }
 
-// primaryKeyColumn returns the index of the first primary key column.
-func primaryKeyColumn(entry *changeset.ChangesetEntry) (int, error) {
-	for i, isPK := range entry.Table.PrimaryKeys {
+func hasPrimaryKey(entry *changeset.ChangesetEntry) bool {
+	for _, isPK := range entry.Table.PrimaryKeys {
 		if isPK {
-			return i, nil
+			return true
 		}
 	}
-	return -1, errNoPrimaryKey
+	return false
+}
+
+// singleIntPK returns the key of a table with exactly one primary-key
+// column holding an integer — the only kind of key rebase may renumber.
+func singleIntPK(entry *changeset.ChangesetEntry) (int64, bool) {
+	vals := changeset.PrimaryKeyValues(entry)
+	if len(vals) != 1 || vals[0].Type() != changeset.TypeInt {
+		return 0, false
+	}
+	n, _ := vals[0].AsInt()
+	return n, true
+}
+
+// newConflict starts a conflict for the entry's row, carrying its key.
+func newConflict(entry *changeset.ChangesetEntry) ConflictFeature {
+	cf := ConflictFeature{TableName: entry.Table.Name, PKValues: changeset.PrimaryKeyValues(entry)}
+	if n, ok := singleIntPK(entry); ok {
+		cf.PK = int(n)
+	}
+	return cf
+}
+
+// setPK writes a renumbered single-integer key into vals.
+func setPK(entry *changeset.ChangesetEntry, vals []changeset.Value, newPK int64) {
+	for i, isPK := range entry.Table.PrimaryKeys {
+		if isPK {
+			vals[i] = changeset.NewValueInt(newPK)
+		}
+	}
 }
 
 // fileBytesEmpty returns true if the file does not exist or is empty.
@@ -160,25 +183,31 @@ func parseOldChangeset(reader *changeset.Reader, dbInfo *databaseRebaseInfo) err
 		tableInfo, ok := dbInfo.tables[tableName]
 		if !ok {
 			tableInfo = &tableRebaseInfo{
-				inserted: make(map[int]bool),
-				deleted:  make(map[int]bool),
-				updated:  make(map[int][]changeset.Value),
+				inserted: make(map[string][]changeset.Value),
+				deleted:  make(map[string]bool),
+				updated:  make(map[string][]changeset.Value),
 			}
 			dbInfo.tables[tableName] = tableInfo
 		}
 
-		pk, err := getPrimaryKey(entry)
+		key, err := rowKey(entry)
 		if err != nil {
 			return fmt.Errorf("parseOldChangeset: %w", err)
 		}
 
 		switch entry.Op {
 		case changeset.OpInsert:
-			tableInfo.inserted[pk] = true
+			tableInfo.inserted[key] = append([]changeset.Value(nil), entry.NewValues...)
+			if n, ok := singleIntPK(entry); ok {
+				if !tableInfo.hasIntInserted || n > tableInfo.maxIntInserted {
+					tableInfo.maxIntInserted = n
+				}
+				tableInfo.hasIntInserted = true
+			}
 		case changeset.OpDelete:
-			tableInfo.deleted[pk] = true
+			tableInfo.deleted[key] = true
 		case changeset.OpUpdate:
-			tableInfo.updated[pk] = entry.NewValues
+			tableInfo.updated[key] = append([]changeset.Value(nil), entry.NewValues...)
 		}
 	}
 	return nil
@@ -192,18 +221,13 @@ func findMappingForNewChangeset(
 	reader *changeset.Reader,
 	dbInfo *databaseRebaseInfo,
 	mapping *rebaseMapping,
-	freeIndices map[string]int,
+	freeIndices map[string]int64,
 ) error {
 	// Calculate initial free indices: max(theirs.inserted) + 1 per table
+	// (at least 1, as upstream).
 	for tableName, tableInfo := range dbInfo.tables {
-		maxPK := 0
-		for pk := range tableInfo.inserted {
-			if pk > maxPK {
-				maxPK = pk
-			}
-		}
-		if maxPK > 0 || len(tableInfo.inserted) > 0 {
-			freeIndices[tableName] = maxPK + 1
+		if tableInfo.hasIntInserted {
+			freeIndices[tableName] = max(tableInfo.maxIntInserted, 0) + 1
 		}
 	}
 
@@ -223,72 +247,74 @@ func findMappingForNewChangeset(
 			continue // table not in theirs records, no rebasing needed
 		}
 
+		key, err := rowKey(entry)
+		if err != nil {
+			return fmt.Errorf("findMappingForNewChangeset: %w", err)
+		}
+
 		switch entry.Op {
 		case changeset.OpInsert:
-			pk, err := getPrimaryKey(entry)
-			if err != nil {
-				return fmt.Errorf("findMappingForNewChangeset: %w", err)
-			}
-			if tableInfo.inserted[pk] {
-				// Both theirs and ours inserted the same PK → conflict
+			pk, isInt := singleIntPK(entry)
+			if _, theirsToo := tableInfo.inserted[key]; theirsToo {
+				if !isInt {
+					// Text, blob or composite key: there is no "next free"
+					// value, so theirs' row stands (see handleInsert).
+					set, ok := mapping.collided[tableName]
+					if !ok {
+						set = make(map[string]bool)
+						mapping.collided[tableName] = set
+					}
+					set[key] = true
+					continue
+				}
+				// Both theirs and ours inserted the same PK → renumber ours
 				freeIdx, exists := freeIndices[tableName]
 				if !exists {
 					return fmt.Errorf("internal error: freeIndices missing for %s", tableName)
 				}
-				mapping.addPkeyMapping(tableName, pk, freeIdx)
+				mapping.add(tableName, key, pkeyMapping{newPK: freeIdx})
 				freeIndices[tableName] = freeIdx + 1
-			} else {
+			} else if isInt {
 				// Keep track of unmapped inserts for later conflict resolution
-				mappedSet, exists := mapping.unmappedInsertIds[tableName]
+				set, exists := mapping.unmappedInsertIds[tableName]
 				if !exists {
-					mappedSet = make(map[int]bool)
-					mapping.unmappedInsertIds[tableName] = mappedSet
+					set = make(map[int64]string)
+					mapping.unmappedInsertIds[tableName] = set
 				}
-				mappedSet[pk] = true
+				set[pk] = key
 			}
 
-		case changeset.OpUpdate:
-			pk, err := getPrimaryKey(entry)
-			if err != nil {
-				return fmt.Errorf("findMappingForNewChangeset: %w", err)
-			}
-			if tableInfo.deleted[pk] {
-				// Update on deleted feature
-				mapping.addPkeyMapping(tableName, pk, invalidFID)
-			}
-
-		case changeset.OpDelete:
-			pk, err := getPrimaryKey(entry)
-			if err != nil {
-				return fmt.Errorf("findMappingForNewChangeset: %w", err)
-			}
-			if tableInfo.deleted[pk] {
-				// Delete of deleted feature
-				mapping.addPkeyMapping(tableName, pk, invalidFID)
+		case changeset.OpUpdate, changeset.OpDelete:
+			if tableInfo.deleted[key] {
+				// Update or delete of a row theirs deleted
+				mapping.add(tableName, key, pkeyMapping{gone: true})
 			}
 		}
 	}
 
-	// Finalize: if unmapped insert PKs conflict with remapped PKs, remap those too
-	for tableName, unmappedSet := range mapping.unmappedInsertIds {
-		// Build set of all new PKs from mappings
-		usedNewPKs := make(map[int]bool)
-		if tableMappings, ok := mapping.mapIds[tableName]; ok {
-			for _, newPK := range tableMappings {
-				if newPK != invalidFID {
-					usedNewPKs[newPK] = true
-				}
+	// Finalize: if unmapped insert PKs conflict with remapped PKs, remap those
+	// too. Ascending order, so a kept key is never handed out later.
+	for tableName, unmapped := range mapping.unmappedInsertIds {
+		usedNewPKs := make(map[int64]bool)
+		for _, pm := range mapping.mapIds[tableName] {
+			if !pm.gone {
+				usedNewPKs[pm.newPK] = true
 			}
 		}
 
-		for pk := range unmappedSet {
+		pks := make([]int64, 0, len(unmapped))
+		for pk := range unmapped {
+			pks = append(pks, pk)
+		}
+		slices.Sort(pks)
+		for _, pk := range pks {
 			if usedNewPKs[pk] {
 				// Our mapping has introduced a conflict in IDs → remap this old PK too
 				freeIdx, exists := freeIndices[tableName]
 				if !exists {
 					return fmt.Errorf("internal error: freeIndices missing (2) for %s", tableName)
 				}
-				mapping.addPkeyMapping(tableName, pk, freeIdx)
+				mapping.add(tableName, unmapped[pk], pkeyMapping{newPK: freeIdx})
 				usedNewPKs[freeIdx] = true
 				freeIndices[tableName] = freeIdx + 1
 			}
@@ -305,32 +331,36 @@ func findMappingForNewChangeset(
 func handleInsert(
 	entry *changeset.ChangesetEntry,
 	mapping *rebaseMapping,
+	tableInfo *tableRebaseInfo,
 	outEntry *changeset.ChangesetEntry,
+	conflicts *[]ConflictFeature,
 ) (bool, error) {
-	numColumns := entry.Table.ColumnCount()
-	outEntry.Op = changeset.OpInsert
-	outEntry.NewValues = make([]changeset.Value, numColumns)
-
-	pk, err := getPrimaryKey(entry)
+	key, err := rowKey(entry)
 	if err != nil {
 		return false, err
 	}
-	newPK := pk
 
-	if mapping.hasOldPkey(entry.Table.Name, pk) {
-		var mapErr error
-		newPK, mapErr = mapping.getNewPkey(entry.Table.Name, pk)
-		if mapErr != nil {
-			return false, mapErr
+	if mapping.collided[entry.Table.Name][key] {
+		// Both inserted a row with this key and it can't be renumbered:
+		// theirs stands; any value ours inserted differently is a conflict.
+		theirsVals := tableInfo.inserted[key]
+		cf := newConflict(entry)
+		for i, isPK := range entry.Table.PrimaryKeys {
+			if isPK || i >= len(theirsVals) || theirsVals[i].Equal(entry.NewValues[i]) {
+				continue
+			}
+			addConflictItem(&cf, i, changeset.NewValueUndefined(), theirsVals[i], entry.NewValues[i])
 		}
+		if cf.IsValid() {
+			*conflicts = append(*conflicts, cf)
+		}
+		return false, nil
 	}
 
-	for i := 0; i < numColumns; i++ {
-		if entry.Table.PrimaryKeys[i] {
-			outEntry.NewValues[i] = changeset.NewValueInt(int64(newPK))
-		} else {
-			outEntry.NewValues[i] = entry.NewValues[i]
-		}
+	outEntry.Op = changeset.OpInsert
+	outEntry.NewValues = append([]changeset.Value(nil), entry.NewValues...)
+	if pm, ok := mapping.lookup(entry.Table.Name, key); ok && !pm.gone {
+		setPK(entry, outEntry.NewValues, pm.newPK)
 	}
 	return true, nil
 }
@@ -345,42 +375,35 @@ func handleDelete(
 	outEntry.Op = changeset.OpDelete
 	outEntry.OldValues = make([]changeset.Value, numColumns)
 
-	pk, err := getPrimaryKey(entry)
+	key, err := rowKey(entry)
 	if err != nil {
 		return false, err
 	}
-	newPK := pk
 
-	if mapping.hasOldPkey(entry.Table.Name, pk) {
-		var mapErr error
-		newPK, mapErr = mapping.getNewPkey(entry.Table.Name, pk)
-		if mapErr != nil {
-			return false, mapErr
-		}
+	pm, mapped := mapping.lookup(entry.Table.Name, key)
+	if mapped && pm.gone {
 		// Both deleted: skip
-		if newPK == invalidFID {
-			return false, nil
-		}
+		return false, nil
 	}
+	renumbered := mapped
 
 	// Find previously new values (from theirs update) to use as base.
 	// A renumbered key is our own inserted row, not theirs' row of that number.
-	patchedVals, wasUpdated := tableInfo.updated[pk]
-	if !wasUpdated || newPK != pk {
+	patchedVals, wasUpdated := tableInfo.updated[key]
+	if !wasUpdated || renumbered {
 		patchedVals = make([]changeset.Value, numColumns)
 	}
 
 	for i := 0; i < numColumns; i++ {
-		if entry.Table.PrimaryKeys[i] {
-			outEntry.OldValues[i] = changeset.NewValueInt(int64(newPK))
+		patchedVal := patchedVals[i]
+		if !entry.Table.PrimaryKeys[i] && !patchedVal.IsUndefined() {
+			outEntry.OldValues[i] = patchedVal
 		} else {
-			patchedVal := patchedVals[i]
-			if !patchedVal.IsUndefined() {
-				outEntry.OldValues[i] = patchedVal
-			} else {
-				outEntry.OldValues[i] = entry.OldValues[i]
-			}
+			outEntry.OldValues[i] = entry.OldValues[i]
 		}
+	}
+	if renumbered {
+		setPK(entry, outEntry.OldValues, pm.newPK)
 	}
 	return true, nil
 }
@@ -410,48 +433,47 @@ func handleUpdate(
 	outEntry.OldValues = make([]changeset.Value, numColumns)
 	outEntry.NewValues = make([]changeset.Value, numColumns)
 
-	pk, err := getPrimaryKey(entry)
+	key, err := rowKey(entry)
 	if err != nil {
 		return false, err
 	}
 
 	// Check if this update conflicts with a theirs delete
-	newPK := pk
-	if mapping.hasOldPkey(entry.Table.Name, pk) {
-		var mapErr error
-		newPK, mapErr = mapping.getNewPkey(entry.Table.Name, pk)
-		if mapErr != nil {
-			return false, mapErr
-		}
-		if newPK == invalidFID {
-			// Our UPDATE conflicts with their DELETE: delete wins, record conflict
-			cf := ConflictFeature{PK: pk, TableName: entry.Table.Name}
-			for i := 0; i < numColumns; i++ {
-				if !entry.NewValues[i].IsUndefined() {
-					addConflictItem(&cf, i, entry.OldValues[i], changeset.NewValueUndefined(), entry.NewValues[i])
-				}
+	pm, mapped := mapping.lookup(entry.Table.Name, key)
+	if mapped && pm.gone {
+		// Our UPDATE conflicts with their DELETE: delete wins, record conflict
+		cf := newConflict(entry)
+		for i := 0; i < numColumns; i++ {
+			if !entry.NewValues[i].IsUndefined() {
+				addConflictItem(&cf, i, entry.OldValues[i], changeset.NewValueUndefined(), entry.NewValues[i])
 			}
-			if cf.IsValid() {
-				*conflicts = append(*conflicts, cf)
-			}
-			return false, nil
 		}
+		if cf.IsValid() {
+			*conflicts = append(*conflicts, cf)
+		}
+		return false, nil
 	}
 
 	// Find previously new values from theirs update (will be used as old values in rebased version).
 	// A renumbered key is our own inserted row: theirs' row with the old
 	// number is a different feature, so its updates don't apply.
-	renumbered := newPK != pk
-	patchedVals, wasUpdated := tableInfo.updated[pk]
+	renumbered := mapped
+	patchedVals, wasUpdated := tableInfo.updated[key]
 	if !wasUpdated || renumbered {
 		patchedVals = make([]changeset.Value, numColumns)
 	}
 
-	cf := ConflictFeature{PK: pk, TableName: entry.Table.Name}
+	cf := newConflict(entry)
 	entryHasChanges := false
 
 	for i := 0; i < numColumns; i++ {
 		patchedVal := patchedVals[i]
+		if entry.Table.PrimaryKeys[i] {
+			// The key identifies the row: always carried through as is.
+			outEntry.OldValues[i] = entry.OldValues[i]
+			outEntry.NewValues[i] = entry.NewValues[i]
+			continue
+		}
 		if !patchedVal.IsUndefined() && !entry.NewValues[i].IsUndefined() {
 			if patchedVal.Equal(entry.NewValues[i]) {
 				// Both theirs and ours modified to the same value → no change
@@ -481,11 +503,7 @@ func handleUpdate(
 	}
 
 	if renumbered {
-		for i := 0; i < numColumns; i++ {
-			if entry.Table.PrimaryKeys[i] {
-				outEntry.OldValues[i] = changeset.NewValueInt(int64(newPK))
-			}
-		}
+		setPK(entry, outEntry.OldValues, pm.newPK)
 	}
 
 	if cf.IsValid() {
@@ -551,7 +569,7 @@ func prepareNewChangeset(
 			}
 		case changeset.OpInsert:
 			var handleErr error
-			writeEntry, handleErr = handleInsert(entry, mapping, &outEntry)
+			writeEntry, handleErr = handleInsert(entry, mapping, tableIt, &outEntry, conflicts)
 			if handleErr != nil {
 				return fmt.Errorf("prepareNewChangeset: handleInsert: %w", handleErr)
 			}
@@ -649,7 +667,7 @@ func Rebase(
 
 	// Step 2: Build mapping from ours changeset
 	mapping := newRebaseMapping()
-	freeIndices := make(map[string]int)
+	freeIndices := make(map[string]int64)
 	if err := findMappingForNewChangeset(readerOurs, dbInfo, mapping, freeIndices); err != nil {
 		return nil, fmt.Errorf("Rebase: find mapping: %w", err)
 	}
@@ -909,7 +927,7 @@ func MarshalConflicts(conflicts []ConflictFeature) ([]byte, error) {
 		fj := conflictFeatureJSON{
 			Table: cf.TableName,
 			Type:  "conflict",
-			FID:   fmt.Sprintf("%d", cf.PK),
+			FID:   cf.FID(),
 		}
 		for _, item := range cf.Items {
 			cij := conflictItemJSON{Column: item.Column}
